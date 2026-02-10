@@ -1,0 +1,100 @@
+﻿2026-02-09 16:36:36 | INFO     | agent.agent:__init__:19 - Initializing MySQL Analytical Agent
+2026-02-09 16:36:36 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:36:36 | ERROR    | app.main:startup_event:105 - Failed to initialize agent: 'openai_api_key'
+2026-02-09 16:36:36 | INFO     | agent.agent:__init__:19 - Initializing MySQL Analytical Agent
+2026-02-09 16:36:36 | ERROR    | app.main:startup_event:105 - Failed to initialize agent: 'openai_api_key'
+2026-02-09 16:36:36 | INFO     | agent.agent:__init__:19 - Initializing MySQL Analytical Agent
+2026-02-09 16:36:36 | ERROR    | app.main:startup_event:105 - Failed to initialize agent: 'openai_api_key'
+2026-02-09 16:36:37 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:36:39 | INFO     | database.connection:__init__:49 - MySQL connection manager initialized for mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:36:41 | INFO     | app.main:startup_event:92 - Starting MySQL Analytical Agent API
+2026-02-09 16:36:41 | INFO     | app.main:startup_event:93 - Configuration: mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:36:41 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:36:41 | INFO     | agent.agent:__init__:19 - Initializing MySQL Analytical Agent
+2026-02-09 16:36:41 | INFO     | agent.agent:__init__:34 - Agent initialized successfully
+2026-02-09 16:36:41 | INFO     | app.main:startup_event:103 - Agent initialized successfully
+2026-02-09 16:36:46 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:37:15 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:37:40 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:38:29 | INFO     | app.logger:setup_logging:34 - Logging configured successfully
+2026-02-09 16:38:29 | INFO     | app.logger:setup_logging:34 - Logging configured successfully
+2026-02-09 16:38:29 | INFO     | app.logger:setup_logging:34 - Logging configured successfully
+2026-02-09 16:38:29 | INFO     | app.services.redis:__init__:15 - Attempting to connect to Redis at redis-10791.crce219.us-east-1-4.ec2.cloud.redislabs.com:10791
+2026-02-09 16:38:29 | INFO     | app.services.redis:__init__:15 - Attempting to connect to Redis at redis-10791.crce219.us-east-1-4.ec2.cloud.redislabs.com:10791
+2026-02-09 16:38:30 | INFO     | app.services.redis:__init__:15 - Attempting to connect to Redis at redis-10791.crce219.us-east-1-4.ec2.cloud.redislabs.com:10791
+2026-02-09 16:38:30 | INFO     | app.logger:setup_logging:34 - Logging configured successfully
+2026-02-09 16:38:30 | INFO     | app.services.redis:__init__:15 - Attempting to connect to Redis at redis-10791.crce219.us-east-1-4.ec2.cloud.redislabs.com:10791
+2026-02-09 16:38:31 | INFO     | app.services.redis:__init__:29 - Connected to Redis successfully
+2026-02-09 16:38:31 | INFO     | app.services.redis:__init__:29 - Connected to Redis successfully
+2026-02-09 16:38:31 | INFO     | app.services.redis:__init__:29 - Connected to Redis successfully
+2026-02-09 16:38:31 | INFO     | app.services.redis:__init__:29 - Connected to Redis successfully
+2026-02-09 16:38:34 | INFO     | database.connection:__init__:49 - MySQL connection manager initialized for mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:38:34 | INFO     | database.connection:__init__:49 - MySQL connection manager initialized for mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:38:34 | INFO     | database.connection:__init__:49 - MySQL connection manager initialized for mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:38:39 | INFO     | app.logger:setup_logging:34 - Logging configured successfully
+2026-02-09 16:38:39 | INFO     | app.services.redis:__init__:15 - Attempting to connect to Redis at redis-10791.crce219.us-east-1-4.ec2.cloud.redislabs.com:10791
+2026-02-09 16:38:41 | INFO     | app.services.redis:__init__:29 - Connected to Redis successfully
+2026-02-09 16:38:42 | INFO     | app.main:startup_event:92 - Starting MySQL Analytical Agent API
+2026-02-09 16:38:42 | INFO     | app.main:startup_event:93 - Configuration: mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:38:42 | INFO     | app.main:startup_event:92 - Starting MySQL Analytical Agent API
+2026-02-09 16:38:42 | INFO     | app.main:startup_event:93 - Configuration: mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:38:42 | INFO     | app.main:startup_event:92 - Starting MySQL Analytical Agent API
+2026-02-09 16:38:42 | INFO     | app.main:startup_event:93 - Configuration: mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:38:43 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:38:43 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:38:43 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:38:43 | INFO     | agent.agent:__init__:19 - Initializing MySQL Analytical Agent
+2026-02-09 16:38:43 | INFO     | agent.agent:__init__:19 - Initializing MySQL Analytical Agent
+2026-02-09 16:38:43 | INFO     | agent.agent:__init__:19 - Initializing MySQL Analytical Agent
+2026-02-09 16:38:44 | INFO     | database.connection:__init__:49 - MySQL connection manager initialized for mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:38:45 | INFO     | agent.agent:__init__:37 - Agent initialized successfully
+2026-02-09 16:38:45 | INFO     | agent.agent:__init__:37 - Agent initialized successfully
+2026-02-09 16:38:45 | INFO     | app.main:startup_event:103 - Agent initialized successfully
+2026-02-09 16:38:45 | INFO     | app.main:startup_event:103 - Agent initialized successfully
+2026-02-09 16:38:45 | INFO     | agent.agent:__init__:37 - Agent initialized successfully
+2026-02-09 16:38:45 | INFO     | app.main:startup_event:103 - Agent initialized successfully
+2026-02-09 16:38:47 | INFO     | database.connection:__init__:49 - MySQL connection manager initialized for mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:38:48 | INFO     | app.main:startup_event:92 - Starting MySQL Analytical Agent API
+2026-02-09 16:38:48 | INFO     | app.main:startup_event:93 - Configuration: mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:38:49 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:38:49 | INFO     | agent.agent:__init__:19 - Initializing MySQL Analytical Agent
+2026-02-09 16:38:49 | INFO     | agent.agent:__init__:37 - Agent initialized successfully
+2026-02-09 16:38:49 | INFO     | app.main:startup_event:103 - Agent initialized successfully
+2026-02-09 16:38:49 | INFO     | app.main:startup_event:92 - Starting MySQL Analytical Agent API
+2026-02-09 16:38:49 | INFO     | app.main:startup_event:93 - Configuration: mysql-service-1-project229.d.aivencloud.com:25609/defaultdb
+2026-02-09 16:38:50 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:38:50 | INFO     | agent.agent:__init__:19 - Initializing MySQL Analytical Agent
+2026-02-09 16:38:50 | INFO     | agent.agent:__init__:37 - Agent initialized successfully
+2026-02-09 16:38:50 | INFO     | app.main:startup_event:103 - Agent initialized successfully
+2026-02-09 16:39:06 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:40:11 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:40:14 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:40:16 | INFO     | app.main:query_database_stream:215 - Received streaming query: What is the total amount spent by Priya Patel?
+2026-02-09 16:40:18 | INFO     | mcp_tools.pii_detect:pii_detect:16 - MCP Tool: pii_detect invoked
+2026-02-09 16:40:22 | INFO     | privacy.encoder:get_analyzer:16 - Presidio AnalyzerEngine loaded successfully
+2026-02-09 16:40:22 | INFO     | privacy.encoder:detect_pii:66 - Detected 1 PII entities
+2026-02-09 16:40:23 | INFO     | mcp_tools.pii_encode:pii_encode:17 - MCP Tool: pii_encode invoked
+2026-02-09 16:40:23 | INFO     | privacy.encoder:detect_pii:66 - Detected 1 PII entities
+2026-02-09 16:40:31 | INFO     | mcp_tools.get_schema:get_schema:47 - Executing get_schema tool
+2026-02-09 16:40:31 | INFO     | mcp_tools.get_schema:get_schema:48 - Using database/schema: defaultdb
+2026-02-09 16:40:32 | INFO     | mcp_tools.get_schema:get_schema:97 - Retrieved full schema for 5 tables
+2026-02-09 16:40:32 | INFO     | mcp_tools.get_schema:get_schema:102 - Filtered schema for role 'admin': 5 tables
+2026-02-09 16:40:44 | INFO     | agent.tools:generate_sql_tool:47 - LangChain tool: generate_sql_tool invoked
+2026-02-09 16:40:44 | INFO     | mcp_tools.generate_sql:generate_sql:33 - Generating SQL for question: What is the total amount spent by [PERSON_203D10B3]?
+2026-02-09 16:40:44 | ERROR    | mcp_tools.generate_sql:generate_sql:94 - Failed to generate SQL: 'openai_api_key'
+2026-02-09 16:40:48 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:41:00 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:41:03 | INFO     | database.connection:test_connection:137 - Database connection test successful
+2026-02-09 16:41:05 | INFO     | app.main:query_database_stream:215 - Received streaming query: What is the total amount spent by Priya Patel?
+2026-02-09 16:41:07 | INFO     | mcp_tools.pii_detect:pii_detect:16 - MCP Tool: pii_detect invoked
+2026-02-09 16:41:07 | INFO     | privacy.encoder:detect_pii:66 - Detected 1 PII entities
+2026-02-09 16:41:07 | INFO     | mcp_tools.pii_encode:pii_encode:17 - MCP Tool: pii_encode invoked
+2026-02-09 16:41:07 | INFO     | privacy.encoder:detect_pii:66 - Detected 1 PII entities
+2026-02-09 16:41:09 | INFO     | mcp_tools.get_schema:get_schema:47 - Executing get_schema tool
+2026-02-09 16:41:09 | INFO     | mcp_tools.get_schema:get_schema:48 - Using database/schema: defaultdb
+2026-02-09 16:41:09 | INFO     | mcp_tools.get_schema:get_schema:97 - Retrieved full schema for 5 tables
+2026-02-09 16:41:09 | INFO     | mcp_tools.get_schema:get_schema:102 - Filtered schema for role 'admin': 5 tables
+2026-02-09 16:41:24 | INFO     | agent.tools:generate_sql_tool:47 - LangChain tool: generate_sql_tool invoked
+2026-02-09 16:41:24 | INFO     | mcp_tools.generate_sql:generate_sql:33 - Generating SQL for question: What is the total amount spent by [PERSON_203D10B3]?
+2026-02-09 16:41:24 | ERROR    | mcp_tools.generate_sql:generate_sql:94 - Failed to generate SQL: 'openai_api_key'
+2026-02-09 16:41:28 | INFO     | database.connection:test_connection:137 - Database connection test successful

@@ -1,0 +1,259 @@
+{
+  "version": "1.0",
+  "description": "MCP tools for MySQL analytical agent",
+  "tools": [
+    {
+      "name": "get_schema",
+      "description": "Retrieves the database schema including all tables, columns, data types, and constraints. This tool connects to the MySQL database and returns structured information about the database structure.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "columns": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      },
+                      "nullable": {
+                        "type": "boolean"
+                      },
+                      "key": {
+                        "type": "string"
+                      },
+                      "default": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "extra": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "generate_sql",
+      "description": "Converts a natural language question into a SQL query. Uses LLM and database schema to generate safe, optimized SQL SELECT statements. Prevents generation of harmful SQL operations.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "Natural language question to convert to SQL"
+          },
+          "schema": {
+            "type": "object",
+            "description": "Database schema information from get_schema tool"
+          }
+        },
+        "required": [
+          "question",
+          "schema"
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "sql": {
+            "type": "string",
+            "description": "Generated SQL query"
+          }
+        }
+      }
+    },
+    {
+      "name": "execute_sql",
+      "description": "Safely executes a SQL query with automatic safety checks and LIMIT enforcement. Rejects UPDATE, DELETE, INSERT, ALTER, DROP, and TRUNCATE operations. Automatically applies LIMIT 200 if not present.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "sql": {
+            "type": "string",
+            "description": "SQL query to execute (must be SELECT only)"
+          }
+        },
+        "required": [
+          "sql"
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Column names"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "array"
+            },
+            "description": "Result rows"
+          },
+          "row_count": {
+            "type": "integer",
+            "description": "Number of rows returned"
+          }
+        }
+      }
+    },
+    {
+      "name": "summarize_results",
+      "description": "Generates an intelligent, human-readable summary of query results. Analyzes data to identify key insights, patterns, trends, and business implications.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "Original natural language question"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Column names from query results"
+          },
+          "rows": {
+            "type": "array",
+            "description": "Query result rows"
+          },
+          "row_count": {
+            "type": "integer",
+            "description": "Number of rows in results"
+          }
+        },
+        "required": [
+          "question",
+          "columns",
+          "rows",
+          "row_count"
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "description": "Natural language summary with insights"
+          }
+        }
+      }
+    },
+    {
+      "name": "pii_detect",
+      "description": "Detects Personally Identifiable Information (PII) in text. Identifies names, locations, organizations, and other sensitive entities.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The natural language text to analyze"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "entities": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "count": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    {
+      "name": "pii_encode",
+      "description": "Replaces sensitive PII with secure SHA-256 tokens and encrypts original values in memory.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text containing sensitive PII to be masked"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "encoded_text": {
+            "type": "string"
+          },
+          "mappings": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "count": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    {
+      "name": "pii_decode",
+      "description": "Restores secure placeholder tokens back to their original sensitive values.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text containing tokens to be restored"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "decoded_text": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ]
+}
