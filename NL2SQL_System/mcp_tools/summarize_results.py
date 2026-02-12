@@ -1,14 +1,48 @@
 """MCP Tool D: summarize_results - Generate intelligent summaries of query results."""
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from loguru import logger
 from langchain_openai import AzureChatOpenAI
 from pydantic import SecretStr
 from langchain_core.prompts import ChatPromptTemplate
 from app.config import settings
-import json
+from utils.trace_logger import emit_trace_event, start_timer, elapsed_ms
 
 
-def summarize_results(question: str, columns: List[str], rows: List[List[Any]], row_count: int) -> Dict[str, str]:
+def _clip(text: Any, limit: int = 300) -> str:
+    s = str(text)
+    return s if len(s) <= limit else s[:limit] + "...(truncated)"
+
+
+def _extract_usage(response: Any) -> Dict[str, Any]:
+    usage = getattr(response, "usage_metadata", None)
+    if usage:
+        return usage
+    response_metadata = getattr(response, "response_metadata", None)
+    if isinstance(response_metadata, dict):
+        return response_metadata.get("token_usage", {}) or response_metadata.get("usage", {})
+    return {}
+
+
+def _serialize_messages(messages: Any) -> Any:
+    serialized = []
+    for msg in messages:
+        serialized.append(
+            {
+                "type": getattr(msg, "type", None),
+                "content": getattr(msg, "content", str(msg)),
+                "additional_kwargs": getattr(msg, "additional_kwargs", {}),
+            }
+        )
+    return serialized
+
+
+def summarize_results(
+    question: str,
+    columns: List[str],
+    rows: List[List[Any]],
+    row_count: int,
+    trace_id: Optional[str] = None,
+) -> Dict[str, str]:
     """
     Generate an intelligent, human-readable summary of query results.
 
@@ -30,18 +64,45 @@ def summarize_results(question: str, columns: List[str], rows: List[List[Any]], 
     Raises:
         Exception: If LLM call fails
     """
+    trace_id = trace_id or "no-trace"
+    timer = start_timer()
     logger.info(f"Generating summary for {row_count} rows")
+    emit_trace_event(
+        event="TOOL_INPUT",
+        trace_id=trace_id,
+        tool="summarize_results_tool",
+        payload={
+            "question": question,
+            "columns": columns,
+            "rows": rows,
+            "row_count": row_count,
+        },
+    )
 
     # Early exit for empty or all-NULL aggregates
     if row_count == 0:
-        return {"summary": "No matching records were found for this query."}
+        result = {"summary": "No matching records were found for this query."}
+        emit_trace_event(
+            event="TOOL_OUTPUT",
+            trace_id=trace_id,
+            tool="summarize_results_tool",
+            payload={"result": result, "execution_time_ms": elapsed_ms(timer)},
+        )
+        return result
     if (
         row_count == 1
         and rows
         and isinstance(rows[0], list)
         and all(val is None for val in rows[0])
     ):
-        return {"summary": "No matching records were found for this query (the result returned NULL)."}
+        result = {"summary": "No matching records were found for this query (the result returned NULL)."}
+        emit_trace_event(
+            event="TOOL_OUTPUT",
+            trace_id=trace_id,
+            tool="summarize_results_tool",
+            payload={"result": result, "execution_time_ms": elapsed_ms(timer)},
+        )
+        return result
 
     # EARLY EXIT: multi-table COUNT aggregation
     if (
@@ -51,7 +112,14 @@ def summarize_results(question: str, columns: List[str], rows: List[List[Any]], 
         and rows[0]
         and isinstance(rows[0][0], dict)
     ):
-        return _summarize_multi_table_counts(question, rows)
+        result = _summarize_multi_table_counts(question, rows)
+        emit_trace_event(
+            event="TOOL_OUTPUT",
+            trace_id=trace_id,
+            tool="summarize_results_tool",
+            payload={"result": result, "execution_time_ms": elapsed_ms(timer)},
+        )
+        return result
 
     try:
         # Initialize LLM
@@ -65,6 +133,15 @@ def summarize_results(question: str, columns: List[str], rows: List[List[Any]], 
 
         # Format results for prompt
         results_preview = _format_results_for_prompt(columns, rows, row_count)
+        emit_trace_event(
+            event="TRANSFORM",
+            trace_id=trace_id,
+            tool="summarize_results_tool",
+            payload={
+                "name": "results_preview",
+                "results_preview": results_preview,
+            },
+        )
 
         # Check if question is analysis-related
         is_analytical = _is_analytical_question(question)
@@ -73,6 +150,16 @@ def summarize_results(question: str, columns: List[str], rows: List[List[Any]], 
         statistical_insights = ""
         if is_analytical and row_count > 1:
             statistical_insights = _perform_statistical_analysis(columns, rows)
+        emit_trace_event(
+            event="TRANSFORM",
+            trace_id=trace_id,
+            tool="summarize_results_tool",
+            payload={
+                "name": "statistical_analysis",
+                "is_analytical": is_analytical,
+                "statistical_insights": statistical_insights,
+            },
+        )
 
         # Always provide analysis (even for single-row results)
         stats_section = ""
@@ -130,8 +217,23 @@ Data Preview:
             ("system", system_prompt),
             ("human", "Please provide the answer/summary based on these results.")
         ])
+        rendered_messages = prompt_template.format_messages(
+            question=question,
+            columns=", ".join(columns),
+            row_count=row_count,
+            results_preview=results_preview,
+        )
+        emit_trace_event(
+            event="LLM_PROMPT",
+            trace_id=trace_id,
+            tool="summarize_results_tool",
+            payload={"messages": _serialize_messages(rendered_messages)},
+        )
 
-        # Generate summary
+        # Generate summary (audit: log masked question sent to LLM)
+        logger.info(
+            f"LLM_INVOKE tool=summarize_results_tool masked_question={_clip(question)} row_count={row_count} columns={_clip(columns, 180)}"
+        )
         chain = prompt_template | llm
         response = chain.invoke({
             "question": question,
@@ -139,14 +241,45 @@ Data Preview:
             "row_count": row_count,
             "results_preview": results_preview
         })
+        logger.info(f"LLM_RESPONSE tool=summarize_results_tool raw_response={_clip(response.content)}")
+        emit_trace_event(
+            event="LLM_RAW_RESPONSE",
+            trace_id=trace_id,
+            tool="summarize_results_tool",
+            payload={
+                "response_content": response.content,
+                "response_metadata": getattr(response, "response_metadata", {}),
+                "usage": _extract_usage(response),
+            },
+        )
 
         summary = response.content.strip()
 
         logger.info("Successfully generated summary")
-        return {"summary": summary}
+        result = {"summary": summary}
+        emit_trace_event(
+            event="TOOL_OUTPUT",
+            trace_id=trace_id,
+            tool="summarize_results_tool",
+            payload={
+                "result": result,
+                "execution_time_ms": elapsed_ms(timer),
+            },
+        )
+        return result
 
     except Exception as e:
         logger.error(f"Failed to generate summary: {e}")
+        emit_trace_event(
+            event="TOOL_ERROR",
+            trace_id=trace_id,
+            tool="summarize_results_tool",
+            payload={
+                "error": str(e),
+                "execution_time_ms": elapsed_ms(timer),
+            },
+            level="error",
+        )
         raise
 
 
@@ -300,24 +433,3 @@ def _summarize_multi_table_counts(question: str, results: List[List[Dict[str, An
     )
 
     return {"summary": summary}
-
-
-if __name__ == "__main__":
-    # Test the tool
-    test_columns = ["id", "name", "age", "city"]
-    test_rows = [
-        [1, "Alice", 30, "New York"],
-        [2, "Bob", 25, "Los Angeles"],
-        [3, "Charlie", 35, "Chicago"],
-        [4, "Diana", 28, "Houston"],
-        [5, "Eve", 32, "Phoenix"]
-    ]
-
-    result = summarize_results(
-        question="Show me all users in the database",
-        columns=test_columns,
-        rows=test_rows,
-        row_count=len(test_rows)
-    )
-
-    print(result["summary"])

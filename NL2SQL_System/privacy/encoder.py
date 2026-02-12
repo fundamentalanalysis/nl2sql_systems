@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import threading
+import re
 from typing import Dict, List, Tuple, Any
 from privacy.config import encrypt_value
 from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern, RecognizerRegistry
@@ -21,6 +22,13 @@ PII_ENTITIES = [
     "PHONE_NUMBER",
     "IN_AADHAAR",
 ]
+
+_PERSON_SUFFIX_STOPWORDS = {
+    "and", "or", "of", "to", "for", "from", "in", "on", "at", "by", "with",
+    "details", "detail", "show", "get", "give", "find", "list", "about",
+    "belongs", "belonging", "customer", "customers", "order", "orders",
+    "email", "emails", "phone", "phones", "address", "addresses",
+}
 
 def get_analyzer():
     """Lazy load the Presidio analyzer and handle missing models gracefully."""
@@ -100,6 +108,48 @@ _PII_TTL_SECONDS = 86400
 _TOKEN_FILE = os.path.join(os.path.dirname(__file__), ".token_store.json")
 _TOKEN_FILE_LOCK = threading.Lock()
 
+# Columns that are generally safe to skip for result-side PII detection.
+_SAFE_RESULT_COLUMNS = {
+    "postal_code",
+    "zipcode",
+    "zip_code",
+    "country_code",
+    "state_code",
+    "item_status",
+    "order_status",
+}
+
+
+def _is_low_risk_result_column(column_name: str) -> bool:
+    col = (column_name or "").strip().lower()
+    if not col:
+        return False
+    if col in _SAFE_RESULT_COLUMNS:
+        return True
+    if col.endswith("_id") or col.endswith("_count"):
+        return True
+    if col.startswith("is_") or col.startswith("has_"):
+        return True
+    return False
+
+
+def _is_pii_candidate_text(value: str) -> bool:
+    """
+    Fast pre-filter to avoid expensive NLP on obvious non-PII strings.
+    """
+    if not value:
+        return False
+    s = value.strip()
+    if not s:
+        return False
+    # Pure numeric / punctuation-like strings (postal codes, IDs, etc.)
+    if not any(ch.isalpha() for ch in s):
+        return False
+    # Tiny tokens are unlikely to carry meaningful PII
+    if len(s) < 3:
+        return False
+    return True
+
 
 def _load_token_file() -> Dict[str, str]:
     if not os.path.exists(_TOKEN_FILE):
@@ -150,11 +200,70 @@ def detect_pii(text: str) -> List[Dict[str, Any]]:
                 "end": res.end,
                 "score": res.score
             })
-        logger.info(f"Detected {len(pii_entities)} PII entities")
+        pii_entities = _expand_person_entities(text, pii_entities)
+        # Debug-level to avoid noisy logs in row-by-row result masking loops.
+        logger.debug(f"Detected {len(pii_entities)} PII entities")
         return pii_entities
     except Exception as e:
         logger.error(f"PII Detection failed: {e}")
-        return _regex_detect_pii(text)
+        return _expand_person_entities(text, _regex_detect_pii(text))
+
+
+def _expand_person_entities(text: str, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Post-process PERSON entities to capture likely full names when detector
+    catches only the first token (e.g., 'erin' from 'erin white').
+    """
+    if not entities:
+        return entities
+
+    expanded: List[Dict[str, Any]] = []
+    entities_sorted = sorted(entities, key=lambda x: (x.get("start", 0), x.get("end", 0)))
+
+    for ent in entities_sorted:
+        if ent.get("entity_type") != "PERSON":
+            expanded.append(ent)
+            continue
+
+        start = ent.get("start")
+        end = ent.get("end")
+        if not isinstance(start, int) or not isinstance(end, int) or start < 0 or end > len(text) or start >= end:
+            expanded.append(ent)
+            continue
+
+        # If current PERSON already looks multi-token, keep as-is.
+        current_value = text[start:end].strip()
+        if len(current_value.split()) >= 2:
+            expanded.append(ent)
+            continue
+
+        # Expand to include one adjacent surname-like token.
+        m = re.match(r"\s+([A-Za-z][A-Za-z'\-]{1,29})\b", text[end:])
+        if not m:
+            expanded.append(ent)
+            continue
+
+        next_token = m.group(1)
+        if next_token.lower() in _PERSON_SUFFIX_STOPWORDS:
+            expanded.append(ent)
+            continue
+
+        new_end = end + m.end(1)
+        updated = dict(ent)
+        updated["end"] = new_end
+        expanded.append(updated)
+
+    # Deduplicate exact overlaps after expansion.
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for ent in expanded:
+        key = (ent.get("entity_type"), ent.get("start"), ent.get("end"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ent)
+
+    return deduped
 
 def get_token_hash(value: str, entity_type: str) -> str:
     """Generate a unique but safe-looking token using SHA-256."""
@@ -207,11 +316,23 @@ def encode_results(columns: List[str], rows: List[List[Any]]) -> List[List[Any]]
     """
     Scans query results for PII and replaces with tokens.
     """
+    safe_idx = {
+        idx
+        for idx, col in enumerate(columns or [])
+        if _is_low_risk_result_column(col)
+    }
+
     encoded_rows = []
+    masked_cells = 0
+    scanned_strings = 0
     for row in rows:
         encoded_row = []
-        for val in row:
+        for idx, val in enumerate(row):
             if isinstance(val, str):
+                scanned_strings += 1
+                if idx in safe_idx or not _is_pii_candidate_text(val):
+                    encoded_row.append(val)
+                    continue
                 # Use detect_pii on the string
                 entities = detect_pii(val)
                 if entities:
@@ -227,12 +348,16 @@ def encode_results(columns: List[str], rows: List[List[Any]]) -> List[List[Any]]
                         else:
                             _persist_token(token, encrypted_val)
                         ev = ev[:ent['start']] + token + ev[ent['end']:]
+                    masked_cells += 1
                     encoded_row.append(ev)
                 else:
                     encoded_row.append(val)
             else:
                 encoded_row.append(val)
         encoded_rows.append(encoded_row)
+    logger.info(
+        f"Result PII masking summary: rows={len(rows)}, scanned_strings={scanned_strings}, masked_cells={masked_cells}"
+    )
     return encoded_rows
 
 def get_encrypted_mapping() -> Dict[str, str]:

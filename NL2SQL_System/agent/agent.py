@@ -1,14 +1,276 @@
 """LangChain agent setup with tool calling."""
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from langchain_openai import AzureChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from loguru import logger
-from pydantic import SecretStr
 from app.config import settings
 from agent.tools import LANGCHAIN_TOOLS
 from mcp_tools.get_schema import get_schema as mcp_get_schema
+from mcp_tools.generate_sql import generate_sql as mcp_generate_sql
+from mcp_tools.execute_sql import execute_sql as mcp_execute_sql
+from mcp_tools.summarize_results import summarize_results as mcp_summarize_results
+from mcp_tools.pii_detect import pii_detect as mcp_pii_detect
+from mcp_tools.pii_encode import pii_encode as mcp_pii_encode
+from mcp_tools.pii_decode import pii_decode as mcp_pii_decode
+from privacy.decoder import decode_results
+from database.connection import db_manager
 import time
 import json
+from uuid import uuid4
+from utils.trace_logger import emit_trace_event, start_timer, elapsed_ms
+
+
+def _new_trace_id() -> str:
+    return uuid4().hex[:10]
+
+
+def _short(value: Any, limit: int = 220) -> str:
+    text = str(value)
+    return text if len(text) <= limit else text[:limit] + "...(truncated)"
+
+
+def _extract_direct_answer_preview(text: str, limit: int = 260) -> str:
+    s = (text or "").strip()
+    marker = "1. **Direct Answer:**"
+    idx = s.find(marker)
+    if idx != -1:
+        s = s[idx + len(marker):].strip()
+    # Collapse newlines for cleaner single-line logs.
+    s = " ".join(s.split())
+    return _short(s, limit)
+
+
+def _safe_tool_args(tool_args: Any) -> Any:
+    if not isinstance(tool_args, dict):
+        return _short(tool_args)
+    safe = {}
+    for key, value in tool_args.items():
+        safe[key] = _short(value) if isinstance(value, str) else value
+    return safe
+
+
+def _tool_result_summary(tool_name: str, tool_result: Any, source_text: Optional[str] = None) -> str:
+    if tool_name == "execute_sql_tool" and isinstance(tool_result, dict):
+        row_count = tool_result.get("row_count")
+        cols = tool_result.get("columns", [])
+        return f"rows={row_count}, columns={len(cols)}"
+    if tool_name == "pii_detect_tool" and isinstance(tool_result, dict):
+        if source_text:
+            return f"entities={tool_result.get('count', 0)}, values={_pii_entity_value_summary(source_text, tool_result)}"
+        return f"entities={tool_result.get('count', 0)}, types={_pii_entity_type_summary(tool_result)}"
+    if tool_name == "pii_encode_tool" and isinstance(tool_result, dict):
+        return f"mappings={tool_result.get('count', 0)}, encoded_text={_short(tool_result.get('encoded_text', ''))}"
+    if tool_name == "generate_sql_tool":
+        return f"sql={tool_result}"
+    if tool_name == "summarize_results_tool":
+        text = str(tool_result)
+        masked_tokens = text.count("[PERSON_") + text.count("[LOCATION_") + text.count("[EMAIL_ADDRESS_")
+        return f"summary_len={len(text)}, masked_tokens={masked_tokens}"
+    if tool_name == "pii_decode_tool":
+        text = str(tool_result)
+        remaining_tokens = text.count("[PERSON_") + text.count("[LOCATION_") + text.count("[EMAIL_ADDRESS_")
+        return (
+            f"decoded_len={len(text)}, tokens_remaining={remaining_tokens}, "
+            f"direct_answer={_extract_direct_answer_preview(text)}"
+        )
+    return _short(tool_result)
+
+
+def _pii_entity_type_summary(pii_result: Dict[str, Any]) -> str:
+    entities = pii_result.get("entities", []) if isinstance(pii_result, dict) else []
+    if not entities:
+        return "none"
+
+    counts: Dict[str, int] = {}
+    for ent in entities:
+        et = str(ent.get("entity_type", "UNKNOWN")).upper()
+        counts[et] = counts.get(et, 0) + 1
+
+    parts = [f"{et}({cnt})" for et, cnt in sorted(counts.items(), key=lambda x: x[0])]
+    return ", ".join(parts)
+
+
+def _pii_entity_value_summary(source_text: str, pii_result: Dict[str, Any]) -> str:
+    entities = pii_result.get("entities", []) if isinstance(pii_result, dict) else []
+    if not entities:
+        return "none"
+
+    values: List[str] = []
+    for ent in entities:
+        s = ent.get("start")
+        e = ent.get("end")
+        if isinstance(s, int) and isinstance(e, int) and 0 <= s < e <= len(source_text):
+            val = source_text[s:e].strip()
+            if val:
+                values.append(val)
+
+    # Preserve order, remove duplicates (case-insensitive)
+    seen = set()
+    uniq = []
+    for val in values:
+        key = val.lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(val)
+
+    return ", ".join(uniq) if uniq else "none"
+
+
+def _human_log(message: str) -> None:
+    print(message, flush=True)
+
+
+def _human_banner(title: str, lines: Optional[List[Tuple[str, str]]] = None) -> None:
+    bar = "━" * 50
+    _human_log(bar)
+    _human_log(title)
+    if lines:
+        for key, value in lines:
+            _human_log(f"   {key:<10}: {value}")
+    _human_log(bar)
+
+
+def _human_step(step_num: int, title: str, detail: Optional[str] = None) -> None:
+    _human_log(f"\n{title}")
+    if detail:
+        _human_log(f"   -> {detail}")
+
+
+def _schema_has_column(schema: Dict[str, Any], table: str, column: str) -> bool:
+    for t in schema.get("tables", []):
+        if t.get("name") == table:
+            return any(c.get("name") == column for c in t.get("columns", []))
+    return False
+
+
+def _extract_entity_values(question: str, pii_detect_res: Dict[str, Any], entity_type: str) -> List[str]:
+    values: List[str] = []
+    entities = pii_detect_res.get("entities", []) if isinstance(pii_detect_res, dict) else []
+    for ent in entities:
+        if ent.get("entity_type") != entity_type:
+            continue
+        s = ent.get("start")
+        e = ent.get("end")
+        if isinstance(s, int) and isinstance(e, int) and 0 <= s < e <= len(question):
+            val = question[s:e].strip()
+            if val:
+                values.append(val)
+    # Preserve order, remove duplicates
+    seen = set()
+    uniq = []
+    for v in values:
+        key = v.lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(v)
+    return uniq
+
+
+def _count_column_matches(table: str, column: str, value: str) -> int:
+    query = f"SELECT COUNT(*) AS c FROM {table} WHERE LOWER({column}) = LOWER(%s)"
+    try:
+        with db_manager.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (value,))
+                row = cursor.fetchone() or {}
+                return int(row.get("c", 0))
+    except Exception:
+        return 0
+
+
+def _build_location_resolution_hint(
+    question: str,
+    pii_detect_res: Dict[str, Any],
+    schema: Dict[str, Any],
+    trace_id: str,
+) -> Optional[str]:
+    """
+    Resolve LOCATION entity to best-fit customers column (state/country/city) by DB value checks.
+    Returns a compact hint string for SQL generation or None.
+    """
+    location_values = _extract_entity_values(question, pii_detect_res, "LOCATION")
+    emit_trace_event(
+        event="TRANSFORM",
+        trace_id=trace_id,
+        tool="location_resolver",
+        payload={
+            "name": "extract_location_entities",
+            "location_values": location_values,
+        },
+    )
+    if not location_values:
+        return None
+
+    if not _schema_has_column(schema, "customers", "state") and not _schema_has_column(schema, "customers", "country") and not _schema_has_column(schema, "customers", "city"):
+        return None
+
+    target_cols = []
+    for col in ("state", "country", "city"):
+        if _schema_has_column(schema, "customers", col):
+            target_cols.append(col)
+
+    hints = []
+    for loc in location_values:
+        counts: Dict[str, int] = {}
+        for col in target_cols:
+            counts[col] = _count_column_matches("customers", col, loc)
+
+        # Prefer highest non-zero match. If tie, prefer state > city > country for customer geo queries.
+        best_col = None
+        best_count = 0
+        pref_order = {"state": 3, "city": 2, "country": 1}
+        for col, cnt in counts.items():
+            if cnt > best_count:
+                best_col, best_count = col, cnt
+            elif cnt == best_count and cnt > 0 and best_col is not None:
+                if pref_order.get(col, 0) > pref_order.get(best_col, 0):
+                    best_col = col
+
+        if best_col and best_count > 0:
+            logger.info(
+                f"[trace={trace_id}] LOCATION_RESOLVER value={loc!r} chosen=customers.{best_col} counts={counts}"
+            )
+            emit_trace_event(
+                event="INTERNAL_ACTION",
+                trace_id=trace_id,
+                tool="location_resolver",
+                payload={
+                    "value": loc,
+                    "counts": counts,
+                    "chosen_column": f"customers.{best_col}",
+                    "matched_rows": best_count,
+                },
+            )
+            hints.append(
+                f"For location '{loc}', use customers.{best_col} (exact DB match found)."
+            )
+        else:
+            logger.info(
+                f"[trace={trace_id}] LOCATION_RESOLVER value={loc!r} no_exact_match counts={counts}"
+            )
+            emit_trace_event(
+                event="INTERNAL_ACTION",
+                trace_id=trace_id,
+                tool="location_resolver",
+                payload={
+                    "value": loc,
+                    "counts": counts,
+                    "chosen_column": None,
+                },
+            )
+
+    if not hints:
+        return None
+    hint = " LOCATION_COLUMN_HINTS: " + " ".join(hints)
+    emit_trace_event(
+        event="TRANSFORM",
+        trace_id=trace_id,
+        tool="location_resolver",
+        payload={
+            "name": "build_location_hint",
+            "hint": hint,
+        },
+    )
+    return hint
 
 
 class MySQLAnalyticalAgent:
@@ -37,441 +299,404 @@ class MySQLAnalyticalAgent:
         logger.info("Agent initialized successfully")
 
     def query(self, question: str, role: str = "admin") -> Dict[str, Any]:
-        """
-        Process a natural language question and return the analysis.
-        RBAC is currently disabled (forcing admin access).
-        """
-        # Force admin role for full access
+        """Deterministic privacy-first pipeline (no planner LLM step)."""
         role = "admin"
-
-        print(f"Processing query: {question}", flush=True)
-        print(f"🚀 Starting End-to-End Pipeline for query: '{question}'", flush=True)
-        
+        trace_id = _new_trace_id()
         start_time = time.time()
+        timer = start_timer()
+        steps = 7
+
+        logger.info(f"[trace={trace_id}] QUERY_START role={role} question={_short(question)}")
+        logger.info(f"[trace={trace_id}] PIPELINE User -> PII Detect -> PII Encode -> SQL LLM -> SQL Decode/Execute -> PII Encode Results -> Summary LLM -> PII Decode Final")
+        emit_trace_event(
+            event="QUERY_START",
+            trace_id=trace_id,
+            tool="agent",
+            payload={"role": role, "question": question},
+        )
+        _human_banner(
+            "🔵 New Query Received",
+            [("Trace ID", trace_id), ("User Role", role), ("Question", question)],
+        )
+
         try:
-            # 1. Mandatory Schema Preloading
-            # Fetch RBAC-filtered schema before planning starts
-            schema_dict = mcp_get_schema(role)
-            schema_str = json.dumps(schema_dict, indent=2)
+            sql_llm_time = 0.0
+            db_exec_time = 0.0
+            summary_llm_time = 0.0
+            logger.info(f"[trace={trace_id}] TOOL_START step=1 tool=pii_detect_tool")
+            _human_step(1, "🔎 Step 1: Detecting Sensitive Information (PII)")
+            pii_detect_res = mcp_pii_detect(question, trace_id=trace_id)
+            _human_log(
+                f"   -> Found {pii_detect_res.get('count', 0)} sensitive entities "
+                f"[{_pii_entity_value_summary(question, pii_detect_res)}]"
+            )
+            logger.info(
+                f"[trace={trace_id}] TOOL_DONE step=1 tool=pii_detect_tool "
+                f"result={_tool_result_summary('pii_detect_tool', pii_detect_res, question)}"
+            )
 
-            # System message with injected schema
-            system_msg = SystemMessage(content=f"""You are a MySQL analytical agent for an Indian-based application. 
-            
-CURRENT USER ROLE: {role}
+            logger.info(f"[trace={trace_id}] TOOL_START step=2 tool=pii_encode_tool")
+            _human_step(2, "🔐 Step 2: Protecting Sensitive Data")
+            pii_encode_res = mcp_pii_encode(question, trace_id=trace_id)
+            encoded_question = pii_encode_res.get("encoded_text", question)
+            emit_trace_event(
+                event="TRANSFORM",
+                trace_id=trace_id,
+                tool="agent",
+                payload={
+                    "name": "encoded_question",
+                    "original_question": question,
+                    "encoded_question": encoded_question,
+                },
+            )
+            _human_log(f"   -> Masked query: {_short(encoded_question, 180)}")
+            logger.info(f"[trace={trace_id}] TOOL_DONE step=2 tool=pii_encode_tool result={_tool_result_summary('pii_encode_tool', pii_encode_res)}")
 
-ALLOWED DATABASE SCHEMA:
-```json
-{schema_str}
-```
+            logger.info(f"[trace={trace_id}] TOOL_START step=3 tool=get_schema_tool")
+            _human_step(3, "📚 Step 3: Loading Allowed Schema")
+            schema = mcp_get_schema(role, trace_id=trace_id)
+            _human_log(f"   -> Loaded {len(schema.get('tables', []))} tables")
+            logger.info(f"[trace={trace_id}] TOOL_DONE step=3 tool=get_schema_tool tables={len(schema.get('tables', []))}")
 
-WORKFLOW - Follow these steps IN ORDER:
-1. Call pii_detect_tool(question) to find sensitive information.
-2. Call pii_encode_tool(question) to mask PII with tokens.
-   - Use the 'encoded_text' from this step for all subsequent logic.
-3. Call get_schema_tool(role='{role}') to review allowed tables/columns.
-4. Call generate_sql_tool(encoded_question, db_schema) using the MASKED question.
-5. Call execute_sql_tool(sql, role='{role}') to run the query.
-6. Call summarize_results_tool(encoded_question, results) to create insights.
-7. Call pii_decode_tool(summary) to restore tokens to original values before answering.
+            location_hint = _build_location_resolution_hint(question, pii_detect_res, schema, trace_id)
+            sql_question = encoded_question + (location_hint or "")
+            emit_trace_event(
+                event="TRANSFORM",
+                trace_id=trace_id,
+                tool="agent",
+                payload={
+                    "name": "sql_input_question",
+                    "encoded_question": encoded_question,
+                    "location_hint": location_hint,
+                    "sql_question": sql_question,
+                },
+            )
+            logger.info(f"[trace={trace_id}] TOOL_START step=4 tool=generate_sql_tool args={{'question': {_short(sql_question)}}}")
+            _human_step(4, "🧠 Step 4: Generating SQL using AI", "AI receives masked question only")
+            t_sql_start = time.time()
+            sql_res = mcp_generate_sql(sql_question, schema, trace_id=trace_id)
+            sql_llm_time = time.time() - t_sql_start
+            sql_query = sql_res["sql"]
+            _human_log("   -> SQL query generated successfully")
+            _human_log(f"   -> SQL: {sql_query}")
+            _human_log(f"   -> SQL LLM response time: {sql_llm_time:.2f}s")
+            logger.info(f"[trace={trace_id}] TOOL_DONE step=4 tool=generate_sql_tool sql={sql_query}")
 
-IMPORTANT RULES:
-- NEVER send plain-text PII to SQL generation tools. Use tokens (e.g., [PERSON_XXXX]).
-- Use Indian number system (lakhs, crores) and Rupees (₹) for currency.
-- If information is missing from schema, say "I cannot answer that with the available data."
-""")
+            logger.info(f"[trace={trace_id}] TOOL_START step=5 tool=execute_sql_tool args={{'sql': {_short(sql_query)}, 'role': '{role}'}}")
+            _human_step(5, "🗄️ Step 5: Executing Query in Database")
+            t_db_start = time.time()
+            query_res = mcp_execute_sql(sql_query, role, trace_id=trace_id)
+            db_exec_time = time.time() - t_db_start
+            _human_log(f"   -> Retrieved {query_res.get('row_count', 0)} records")
+            _human_log(f"   -> DB execution time: {db_exec_time:.2f}s")
+            logger.info(f"[trace={trace_id}] TOOL_DONE step=5 tool=execute_sql_tool rows={query_res.get('row_count', 0)} cols={len(query_res.get('columns', []))}")
 
-            human_msg = HumanMessage(content=question)
+            logger.info(f"[trace={trace_id}] TOOL_START step=6 tool=summarize_results_tool")
+            _human_step(6, "🧠 Step 6: Generating Final Answer", f"AI summarizing {query_res.get('row_count', 0)} rows")
+            t_summary_start = time.time()
+            summary_res = mcp_summarize_results(
+                question=encoded_question,
+                columns=query_res["columns"],
+                rows=query_res["rows"],
+                row_count=query_res["row_count"],
+                trace_id=trace_id,
+            )
+            summary_llm_time = time.time() - t_summary_start
+            masked_summary = summary_res["summary"]
+            _human_log(f"   -> Summary LLM response time: {summary_llm_time:.2f}s")
+            logger.info(f"[trace={trace_id}] TOOL_DONE step=6 tool=summarize_results_tool summary_len={len(masked_summary)}")
 
-            messages = [system_msg, human_msg]
-            steps = 0
-            max_iterations = 10
+            logger.info(f"[trace={trace_id}] TOOL_START step=7 tool=pii_decode_tool")
+            _human_step(7, "🔓 Step 7: Restoring Sensitive Data for Final Output")
+            final_answer = mcp_pii_decode(masked_summary, trace_id=trace_id)["decoded_text"]
+            logger.info(f"[trace={trace_id}] TOOL_DONE step=7 tool=pii_decode_tool")
+            emit_trace_event(
+                event="QUERY_FINAL_OUTPUT",
+                trace_id=trace_id,
+                tool="agent",
+                payload={
+                    "masked_summary": masked_summary,
+                    "final_answer": final_answer,
+                },
+            )
 
-            # Agent loop - call tools until we get a final answer
-            while steps < max_iterations:
-                response = self.llm_with_tools.invoke(messages)
-                steps += 1
-
-                # Check if there are tool calls
-                if hasattr(response, 'tool_calls') and response.tool_calls:
-                    messages.append(response)
-
-                    # Execute each tool call
-                    for tool_call in response.tool_calls:
-                        tool_name = tool_call['name']
-                        tool_args = tool_call['args']
-
-                        # CUSTOM LOGGING: Step-specific logs matching user request
-                        if tool_name == 'pii_detect_tool':
-                            print("🔐 Step 1: Detecting and Encoding PII entities...", flush=True)
-                        elif tool_name == 'pii_encode_tool':
-                            print("   - Encoding PII entities...", flush=True)
-                        elif tool_name == 'generate_sql_tool':
-                            print("🧠 Step 2: Generating SQL query using LLM...", flush=True)
-                            if 'question' in tool_args:
-                                print(f"   - Encoded Query: {tool_args['question']}", flush=True)
-                        elif tool_name == 'execute_sql_tool':
-                            print("📊 Step 3: Executing SQL against Database...", flush=True)
-                            if 'sql_query' in tool_args:
-                                print(f"   - Generated SQL: {tool_args['sql_query']}", flush=True)
-                        elif tool_name == 'summarize_results_tool':
-                            print("💬 Step 4: Generating natural language summary...", flush=True)
-                        elif tool_name == 'pii_decode_tool':
-                            print("🔓 Step 5: Decoding PII entities in final response...", flush=True)
-
-                        # Find and execute the tool
-                        tool = next(
-                            (t for t in LANGCHAIN_TOOLS if t.name == tool_name), None)
-                        if tool:
-                            try:
-                                tool_result = tool.invoke(tool_args)
-
-                                # Additional Logging for Results
-                                if tool_name == 'pii_detect_tool':
-                                    # Log detected count
-                                    if isinstance(tool_result, dict) and 'count' in tool_result:
-                                        print(f"   - Found {tool_result['count']} PII entities", flush=True)
-                                    
-                                elif tool_name == 'pii_encode_tool':
-                                    print(f"   - Encoded Result: {str(tool_result)[:100]}...", flush=True)
-                                    
-                                elif tool_name == 'execute_sql_tool':
-                                    try:
-                                        res_len = 0
-                                        if isinstance(tool_result, list):
-                                            res_len = len(tool_result)
-                                        elif isinstance(tool_result, str):
-                                            try:
-                                                parsed = json.loads(tool_result)
-                                                if isinstance(parsed, list):
-                                                    res_len = len(parsed)
-                                            except:
-                                                pass
-                                        print(f"   - Execution Success: Found {res_len} rows", flush=True)
-                                    except:
-                                        print("   - Execution Success", flush=True)
-
-                                # Add tool result to messages
-                                messages.append(ToolMessage(
-                                    content=str(tool_result),
-                                    tool_call_id=tool_call['id']
-                                ))
-                            except Exception as e:
-                                print(f"Tool {tool_name} failed: {e}", flush=True)
-                                logger.error(f"Tool {tool_name} failed: {e}")
-                                messages.append(ToolMessage(
-                                    content=f"Error: {str(e)}",
-                                    tool_call_id=tool_call['id']
-                                ))
-                else:
-                    # No more tool calls - we have the final answer
-                    final_answer = response.content
-                    execution_time = time.time() - start_time
-                    
-                    print("   - Final Answer ready", flush=True)
-                    print("✅ Pipeline Complete: Success", flush=True)
-
-                    return {
-                        "answer": final_answer,
-                        "execution_time": round(execution_time, 2),
-                        "reasoning_steps": steps
-                    }
-
-            # Max iterations reached
             execution_time = time.time() - start_time
-            print("Pipeline failed: Max iterations reached", flush=True)
+            logger.info(f"[trace={trace_id}] QUERY_DONE status=success execution_time={round(execution_time,2)} steps={steps}")
+            emit_trace_event(
+                event="QUERY_DONE",
+                trace_id=trace_id,
+                tool="agent",
+                payload={
+                    "status": "success",
+                    "execution_time_seconds": round(execution_time, 3),
+                    "execution_time_ms": elapsed_ms(timer),
+                    "steps": steps,
+                },
+            )
+            _human_banner(
+                "✅ Query Completed Successfully",
+                [
+                    ("Trace ID", trace_id),
+                    ("Records", str(query_res.get("row_count", 0))),
+                    ("SQL LLM", f"{sql_llm_time:.2f}s"),
+                    ("DB Time", f"{db_exec_time:.2f}s"),
+                    ("Summary LLM", f"{summary_llm_time:.2f}s"),
+                    ("Exec Time", f"{round(execution_time, 2)} seconds"),
+                ],
+            )
+            _human_banner(
+                "🔐 Security Summary",
+                [
+                    ("PII Detected", str(pii_detect_res.get("count", 0))),
+                    ("LLM Masked Input", "YES"),
+                    ("SQL Restored for DB", "YES"),
+                    ("Results Masked pre-LLM", "YES"),
+                    ("Final Output Decoded", "YES"),
+                ],
+            )
             return {
-                "answer": "I reached the maximum number of steps without completing the analysis. Please try a simpler question.",
+                "answer": final_answer,
                 "execution_time": round(execution_time, 2),
                 "reasoning_steps": steps,
-                "error": "Max iterations reached"
             }
-
         except Exception as e:
             execution_time = time.time() - start_time
-            logger.error(f"Query processing failed: {e}")
-
+            logger.exception(f"[trace={trace_id}] QUERY_DONE status=error execution_time={round(execution_time,2)} error={e}")
+            emit_trace_event(
+                event="QUERY_DONE",
+                trace_id=trace_id,
+                tool="agent",
+                payload={
+                    "status": "error",
+                    "error": str(e),
+                    "execution_time_seconds": round(execution_time, 3),
+                    "execution_time_ms": elapsed_ms(timer),
+                },
+                level="error",
+            )
             return {
                 "answer": f"I encountered an error while processing your question: {str(e)}",
                 "execution_time": round(execution_time, 2),
                 "reasoning_steps": 0,
-                "error": str(e)
+                "error": str(e),
             }
 
     def query_stream(self, question: str, role: str = "admin"):
-        """
-        Process a natural language question and yield streaming events.
-        RBAC is currently disabled (forcing admin access).
-        """
-        # Force admin role for full access
+        """Streaming deterministic privacy-first pipeline (no planner LLM step)."""
         role = "admin"
-        """
-        Process a natural language question and yield streaming events.
-
-        Yields events for:
-        - Reasoning step start (tool being called)
-        - Reasoning step complete (tool result)
-        - Final answer chunks (for streaming display)
-
-        Args:
-            question: Natural language question about the database
-
-        Yields:
-            Dict events with types: 'step_start', 'step_complete', 'answer_chunk', 'done', 'error'
-        """
-        logger.info(f"Processing query: {question}")
-        logger.info(f"🚀 Starting End-to-End Pipeline for query: '{question}'")
-        print(f"Processing query: {question}", flush=True)
-        print(f"🚀 Starting End-to-End Pipeline for query: '{question}'", flush=True)
+        trace_id = _new_trace_id()
         start_time = time.time()
+        timer = start_timer()
+
+        step_names = {
+            1: ("pii_detect_tool", "Analyzing Privacy Risk"),
+            2: ("pii_encode_tool", "Masking Sensitive Data"),
+            3: ("get_schema_tool", "Getting Database Schema"),
+            4: ("generate_sql_tool", "Generating SQL Query"),
+            5: ("execute_sql_tool", "Executing Query"),
+            6: ("summarize_results_tool", "Analyzing Results"),
+            7: ("pii_decode_tool", "Restoring Sensitive Data"),
+        }
+
+        def _emit_start(step: int):
+            tool_name, step_name = step_names[step]
+            logger.info(f"[trace={trace_id}] TOOL_START step={step} tool={tool_name}")
+            return {
+                "type": "step_start",
+                "step_name": step_name,
+                "tool_name": tool_name,
+                "step_number": step,
+            }
+
+        def _emit_done(step: int, result: Any):
+            tool_name, step_name = step_names[step]
+            source_text = question if tool_name == "pii_detect_tool" else None
+            logger.info(
+                f"[trace={trace_id}] TOOL_DONE step={step} tool={tool_name} "
+                f"result={_tool_result_summary(tool_name, result, source_text)}"
+            )
+            return {
+                "type": "step_complete",
+                "step_name": step_name,
+                "tool_name": tool_name,
+                "step_number": step,
+                "status": "success",
+                "tool_result": json.dumps(result) if isinstance(result, (dict, list)) else str(result),
+            }
+
+        logger.info(f"[trace={trace_id}] STREAM_START role={role} question={_short(question)}")
+        logger.info(f"[trace={trace_id}] PIPELINE User -> PII Detect -> PII Encode -> SQL LLM -> SQL Decode/Execute -> PII Encode Results -> Summary LLM -> PII Decode Final")
+        emit_trace_event(
+            event="QUERY_START",
+            trace_id=trace_id,
+            tool="agent_stream",
+            payload={"role": role, "question": question},
+        )
+        _human_banner(
+            "🔵 New Query Received",
+            [("Trace ID", trace_id), ("User Role", role), ("Question", question)],
+        )
 
         try:
-            # System message with workflow instructions and role awareness
-            system_msg = SystemMessage(content=f"""You are a MySQL analytical agent for an Indian-based application. 
-
-WORKFLOW - Follow these steps IN ORDER:
-1. Call pii_detect_tool(question) to find sensitive information.
-2. Call pii_encode_tool(question) to mask PII with tokens.
-3. Call get_schema_tool(role='{role}') to get the database schema.
-4. Call generate_sql_tool(encoded_question, db_schema) using the masked question.
-5. Call execute_sql_tool(sql, role='{role}') to run the query.
-6. Call summarize_results_tool(encoded_question, results) to create insights.
-7. Call pii_decode_tool(summary) to restore original values for the final answer.
-
-IMPORTANT:
-- Complete ALL steps in order.
-- NEVER send plain-text names or numbers to the SQL tool.
-- Your final response must be the DECODED summary.
-- Use Indian number system (thousands, lakhs, crores).
-- All monetary values in Indian Rupees (₹).
-""")
-
-            human_msg = HumanMessage(content=question)
-
-            messages = [system_msg, human_msg]
-            steps = 0
-            max_iterations = 10
-
-            # Map tool names to user-friendly step names
-            step_names = {
-                'pii_detect_tool': 'Analyzing Privacy Risk',
-                'pii_encode_tool': 'Masking Sensitive Data',
-                'get_schema_tool': 'Getting Database Schema',
-                'generate_sql_tool': 'Generating SQL Query',
-                'execute_sql_tool': 'Executing Query',
-                'summarize_results_tool': 'Analyzing Results',
-                'pii_decode_tool': 'Restoring Sensitive Data'
-            }
-
-            # Capture query results for visualization
             last_query_results = None
             last_query_results_decoded = None
-            last_pii_summary = None
+            query_res = {}
+            sql_llm_time = 0.0
+            db_exec_time = 0.0
+            summary_llm_time = 0.0
 
-            # Agent loop - call tools until we get a final answer
-            while steps < max_iterations:
-                response = self.llm_with_tools.invoke(messages)
-                steps += 1
-
-                # Check if there are tool calls
-                if hasattr(response, 'tool_calls') and response.tool_calls:
-                    messages.append(response)
-
-                    # Execute each tool call
-                    for tool_call in response.tool_calls:
-                        tool_name = tool_call['name']
-                        tool_args = tool_call['args']
-
-                        # CUSTOM LOGGING: Step-specific logs matching user request
-                        if tool_name == 'pii_detect_tool':
-                            logger.info("🔐 Step 1: Detecting and Encoding PII entities...")
-                            print("🔐 Step 1: Detecting and Encoding PII entities...", flush=True)
-                        elif tool_name == 'pii_encode_tool':
-                            logger.info("   - Encoding PII entities...")
-                            print("   - Encoding PII entities...", flush=True)
-                        elif tool_name == 'generate_sql_tool':
-                            logger.info("🧠 Step 2: Generating SQL query using LLM...")
-                            print("🧠 Step 2: Generating SQL query using LLM...", flush=True)
-                            if 'question' in tool_args:
-                                logger.info(f"   - Encoded Query: {tool_args['question']}")
-                                print(f"   - Encoded Query: {tool_args['question']}", flush=True)
-                        elif tool_name == 'execute_sql_tool':
-                            logger.info("📊 Step 3: Executing SQL against Database...")
-                            print("📊 Step 3: Executing SQL against Database...", flush=True)
-                            if 'sql_query' in tool_args:
-                                logger.info(f"   - Generated SQL: {tool_args['sql_query']}")
-                                print(f"   - Generated SQL: {tool_args['sql_query']}", flush=True)
-                        elif tool_name == 'summarize_results_tool':
-                            logger.info("💬 Step 4: Generating natural language summary...")
-                            print("💬 Step 4: Generating natural language summary...", flush=True)
-                        elif tool_name == 'pii_decode_tool':
-                            logger.info("🔓 Step 5: Decoding PII entities in final response...")
-                            print("🔓 Step 5: Decoding PII entities in final response...", flush=True)
-
-                        # Emit step start event
-                        yield {
-                            'type': 'step_start',
-                            'step_name': step_names.get(tool_name, tool_name),
-                            'tool_name': tool_name,
-                            'step_number': steps
-                        }
-
-                        # Find and execute the tool
-                        tool = next(
-                            (t for t in LANGCHAIN_TOOLS if t.name == tool_name), None)
-                        if tool:
-                            try:
-                                tool_result = tool.invoke(tool_args)
-
-                                # Additional Logging for Results
-                                if tool_name == 'pii_detect_tool':
-                                    # Log detected count
-                                    if isinstance(tool_result, dict) and 'count' in tool_result:
-                                        logger.info(f"   - Found {tool_result['count']} PII entities")
-                                        print(f"   - Found {tool_result['count']} PII entities", flush=True)
-                                        try:
-                                            entities = tool_result.get("entities", [])
-                                            last_pii_summary = {
-                                                "count": tool_result.get("count", 0),
-                                                "entities": [
-                                                    {
-                                                        "type": ent.get("entity_type"),
-                                                        "value": question[ent.get("start", 0):ent.get("end", 0)],
-                                                        "start": ent.get("start"),
-                                                        "end": ent.get("end")
-                                                    }
-                                                    for ent in entities
-                                                ]
-                                            }
-                                        except Exception:
-                                            last_pii_summary = {
-                                                "count": tool_result.get("count", 0),
-                                                "entities": []
-                                            }
-                                    
-                                elif tool_name == 'pii_encode_tool':
-                                    logger.info(f"   - Encoded Result: {str(tool_result)[:100]}...")
-                                    print(f"   - Encoded Result: {str(tool_result)[:100]}...", flush=True)
-
-                                elif tool_name == 'execute_sql_tool':
-                                    try:
-                                        # Parse the result if it's JSON-like
-                                        if isinstance(tool_result, str):
-                                            last_query_results = json.loads(tool_result)
-                                        else:
-                                            last_query_results = tool_result
-                                    except:
-                                        last_query_results = tool_result
-                                    
-                                    # Decode for frontend display (LLM still receives masked results)
-                                    try:
-                                        from privacy.decoder import decode_results
-                                        last_query_results_decoded = decode_results(last_query_results)
-                                    except Exception:
-                                        last_query_results_decoded = last_query_results
-                                    
-                                    try:
-                                        res_len = 0
-                                        if isinstance(last_query_results, list):
-                                            res_len = len(last_query_results)
-                                        logger.info(f"   - Execution Success: Found {res_len} rows")
-                                        print(f"   - Execution Success: Found {res_len} rows", flush=True)
-                                    except:
-                                        logger.info("   - Execution Success")
-                                        print("   - Execution Success", flush=True)
-
-                                # Emit step complete event
-                                yield {
-                                    'type': 'step_complete',
-                                    'step_name': step_names.get(tool_name, tool_name),
-                                    'tool_name': tool_name,
-                                    'step_number': steps,
-                                    'status': 'success',
-                                    'tool_result': str(tool_result)
-                                }
-
-                                # Add tool result to messages
-                                messages.append(ToolMessage(
-                                    content=str(tool_result),
-                                    tool_call_id=tool_call['id']
-                                ))
-                            except Exception as e:
-                                logger.error(f"Tool {tool_name} failed: {e}")
-
-                                # Emit error event for this step
-                                yield {
-                                    'type': 'step_complete',
-                                    'step_name': step_names.get(tool_name, tool_name),
-                                    'tool_name': tool_name,
-                                    'step_number': steps,
-                                    'status': 'error',
-                                    'error': str(e)
-                                }
-
-                                messages.append(ToolMessage(
-                                    content=f"Error: {str(e)}",
-                                    tool_call_id=tool_call['id']
-                                ))
-                else:
-                    # No more tool calls - we have the final answer
-                    final_answer = response.content
-                    
-                    logger.info("   - Final Answer ready")
-                    logger.info("✅ Pipeline Complete: Success")
-                    print("   - Final Answer ready", flush=True)
-                    print("✅ Pipeline Complete: Success", flush=True)
-
-                    if isinstance(final_answer, list):
-                        final_answer = ' '.join(
-                            str(item) for item in final_answer if isinstance(item, str))
-                    execution_time = time.time() - start_time
-
-                    # Stream the answer in chunks (split by sentences or words)
-                    words = final_answer.split(' ')
-                    for i, word in enumerate(words):
-                        yield {
-                            'type': 'answer_chunk',
-                            'content': word + (' ' if i < len(words) - 1 else '')
-                        }
-
-                    # Emit done event with query results for visualization
-                    done_event = {
-                        'type': 'done',
-                        'execution_time': round(execution_time, 2),
-                        'reasoning_steps': steps
+            yield _emit_start(1)
+            _human_step(1, "🔎 Step 1: Detecting Sensitive Information (PII)")
+            pii_detect_res = mcp_pii_detect(question, trace_id=trace_id)
+            _human_log(
+                f"   -> Found {pii_detect_res.get('count', 0)} sensitive entities "
+                f"[{_pii_entity_value_summary(question, pii_detect_res)}]"
+            )
+            pii_entities = pii_detect_res.get("entities", []) if isinstance(pii_detect_res, dict) else []
+            pii_summary = {
+                "count": pii_detect_res.get("count", 0) if isinstance(pii_detect_res, dict) else 0,
+                "entities": [
+                    {
+                        "type": ent.get("entity_type"),
+                        "value": question[ent.get("start", 0):ent.get("end", 0)],
                     }
-
-                    # Include query results if available
-                    if last_query_results:
-                        done_event['data'] = last_query_results_decoded or last_query_results
-                        logger.info(f"Sending {len(last_query_results) if isinstance(last_query_results, list) else '?'} result rows to frontend")
-                    if last_pii_summary is not None:
-                        done_event['pii'] = last_pii_summary
-                    
-                    yield done_event
-                    return
-
-            # Max iterations reached
-            execution_time = time.time() - start_time
-            yield {
-                'type': 'error',
-                'error': 'Max iterations reached',
-                'execution_time': round(execution_time, 2),
-                'reasoning_steps': steps
+                    for ent in pii_entities
+                ],
             }
+            yield _emit_done(1, pii_detect_res)
+
+            yield _emit_start(2)
+            _human_step(2, "🔐 Step 2: Protecting Sensitive Data")
+            pii_encode_res = mcp_pii_encode(question, trace_id=trace_id)
+            encoded_question = pii_encode_res.get("encoded_text", question)
+            _human_log(f"   -> Masked query: {_short(encoded_question, 180)}")
+            yield _emit_done(2, pii_encode_res)
+
+            yield _emit_start(3)
+            _human_step(3, "📚 Step 3: Loading Allowed Schema")
+            schema = mcp_get_schema(role, trace_id=trace_id)
+            _human_log(f"   -> Loaded {len(schema.get('tables', []))} tables")
+            yield _emit_done(3, {"table_count": len(schema.get("tables", []))})
+
+            yield _emit_start(4)
+            _human_step(4, "🧠 Step 4: Generating SQL using AI", "AI receives masked question only")
+            location_hint = _build_location_resolution_hint(question, pii_detect_res, schema, trace_id)
+            sql_question = encoded_question + (location_hint or "")
+            t_sql_start = time.time()
+            sql_res = mcp_generate_sql(sql_question, schema, trace_id=trace_id)
+            sql_llm_time = time.time() - t_sql_start
+            sql_query = sql_res["sql"]
+            _human_log("   -> SQL query generated successfully")
+            _human_log(f"   -> SQL: {sql_query}")
+            _human_log(f"   -> SQL LLM response time: {sql_llm_time:.2f}s")
+            yield _emit_done(4, sql_query)
+
+            yield _emit_start(5)
+            _human_step(5, "🗄️ Step 5: Executing Query in Database")
+            t_db_start = time.time()
+            query_res = mcp_execute_sql(sql_query, role, trace_id=trace_id)
+            db_exec_time = time.time() - t_db_start
+            last_query_results = query_res
+            last_query_results_decoded = decode_results(query_res)
+            _human_log(f"   -> Retrieved {query_res.get('row_count', 0)} records")
+            _human_log(f"   -> DB execution time: {db_exec_time:.2f}s")
+            yield _emit_done(5, query_res)
+
+            yield _emit_start(6)
+            _human_step(6, "🧠 Step 6: Generating Final Answer", f"AI summarizing {query_res.get('row_count', 0)} rows")
+            t_summary_start = time.time()
+            summary_res = mcp_summarize_results(
+                question=encoded_question,
+                columns=query_res["columns"],
+                rows=query_res["rows"],
+                row_count=query_res["row_count"],
+                trace_id=trace_id,
+            )
+            summary_llm_time = time.time() - t_summary_start
+            masked_summary = summary_res["summary"]
+            _human_log(f"   -> Summary LLM response time: {summary_llm_time:.2f}s")
+            yield _emit_done(6, masked_summary)
+
+            yield _emit_start(7)
+            _human_step(7, "🔓 Step 7: Restoring Sensitive Data for Final Output")
+            final_answer = mcp_pii_decode(masked_summary, trace_id=trace_id)["decoded_text"]
+            yield _emit_done(7, final_answer)
+
+            logger.info(f"[trace={trace_id}] FINAL_ANSWER_READY answer_len={len(str(final_answer))}")
+            execution_time = time.time() - start_time
+            logger.info(f"[trace={trace_id}] STREAM_DONE status=success execution_time={round(execution_time,2)}")
+            emit_trace_event(
+                event="QUERY_DONE",
+                trace_id=trace_id,
+                tool="agent_stream",
+                payload={
+                    "status": "success",
+                    "execution_time_seconds": round(execution_time, 3),
+                    "execution_time_ms": elapsed_ms(timer),
+                    "steps": 7,
+                },
+            )
+            _human_banner(
+                "✅ Query Completed Successfully",
+                [
+                    ("Trace ID", trace_id),
+                    ("Records", str(query_res.get("row_count", 0))),
+                    ("SQL LLM", f"{sql_llm_time:.2f}s"),
+                    ("DB Time", f"{db_exec_time:.2f}s"),
+                    ("Summary LLM", f"{summary_llm_time:.2f}s"),
+                    ("Exec Time", f"{round(execution_time, 2)} seconds"),
+                ],
+            )
+            _human_banner(
+                "🔐 Security Summary",
+                [
+                    ("PII Detected", str(pii_summary.get("count", 0))),
+                    ("LLM Masked Input", "YES"),
+                    ("SQL Restored for DB", "YES"),
+                    ("Results Masked pre-LLM", "YES"),
+                    ("Final Output Decoded", "YES"),
+                ],
+            )
+
+            words = str(final_answer).split(" ")
+            for idx, word in enumerate(words):
+                yield {"type": "answer_chunk", "content": word + (" " if idx < len(words) - 1 else "")}
+
+            done_event = {
+                "type": "done",
+                "execution_time": round(execution_time, 2),
+                "reasoning_steps": 7,
+                "trace_id": trace_id,
+                "data": last_query_results_decoded or last_query_results,
+                "pii": pii_summary,
+            }
+            logger.info(
+                f"[trace={trace_id}] FRONTEND_DATA_SENT rows={query_res.get('row_count', '?') if isinstance(query_res, dict) else '?'}"
+            )
+            yield done_event
+            return
 
         except Exception as e:
-            import traceback
-            
             execution_time = time.time() - start_time
-            error_msg = f"Streaming query processing failed: {e}"
-            logger.error(error_msg)
-            logger.error(f"Traceback: {traceback.format_exc()}")
-
+            logger.exception(f"[trace={trace_id}] STREAM_DONE status=error execution_time={round(execution_time,2)} error={e}")
+            emit_trace_event(
+                event="QUERY_DONE",
+                trace_id=trace_id,
+                tool="agent_stream",
+                payload={
+                    "status": "error",
+                    "error": str(e),
+                    "execution_time_seconds": round(execution_time, 3),
+                    "execution_time_ms": elapsed_ms(timer),
+                },
+                level="error",
+            )
             yield {
-                'type': 'error',
-                'error': str(e),
-                'execution_time': round(execution_time, 2),
-                'reasoning_steps': 0
+                "type": "error",
+                "error": str(e),
+                "execution_time": round(execution_time, 2),
+                "reasoning_steps": 0,
+                "trace_id": trace_id,
             }
 
 
@@ -496,7 +721,7 @@ if __name__ == "__main__":
     # Test the agent
     agent = get_agent()
 
-    test_question = "My name is Sreekanth and I live in Bangalore. How many orders have I placed?"
+    test_question = "My name is Jyothika and I live in Narasapur. How many orders have I placed?"
     result = agent.query(test_question)
 
     print("\n" + "="*80)

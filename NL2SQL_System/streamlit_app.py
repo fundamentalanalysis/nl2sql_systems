@@ -16,7 +16,6 @@ import pandas as pd
 import random
 from typing import Dict, Any, Optional, Generator, List
 from dotenv import load_dotenv
-import plotly.express as px
 from datetime import datetime
 
 # ============================================================================
@@ -426,132 +425,23 @@ def query_backend_once(question: str, token: Optional[str] = None) -> Dict[str, 
 
 
 # ============================================================================
-# CHART RENDERING FUNCTIONS
+# DATA TABLE RENDERING FUNCTIONS
 # ============================================================================
 
 
-def detect_chart_type(df: pd.DataFrame) -> str:
-    """
-    Auto-detect the best chart type based on data structure.
-
-    Rules:
-    - Time column (datetime64 or name contains date/time/timestamp) + numeric → line
-    - Categorical (object/string with low cardinality) + numeric → bar
-    - Otherwise → table
-
-    Args:
-        df: DataFrame to analyze
-
-    Returns:
-        'line', 'bar', or 'table'
-    """
-    if df.empty or len(df.columns) < 2:
-        return "table"
-
-    # Identify column types
-    numeric_cols = df.select_dtypes(
-        include=["int64", "float64", "int32", "float32"]).columns.tolist()
-    datetime_cols = df.select_dtypes(include=["datetime64"]).columns.tolist()
-
-    # Check for time-like column names
-    time_keywords = ["date", "time", "timestamp", "year", "month", "day"]
-    time_name_cols = [
-        col for col in df.columns
-        if any(kw in col.lower() for kw in time_keywords)
-    ]
-
-    # Categorical columns (object type)
-    categorical_cols = [
-        col for col in df.select_dtypes(include=["object"]).columns
-        # Allow higher cardinality (renderer will truncate)
-        if df[col].nunique() <= 500
-    ]
-
-    # Rule 1: Time series detection
-    if (datetime_cols or time_name_cols) and numeric_cols:
-        return "line"
-
-    # Rule 2: Categorical + numeric → bar chart
-    if categorical_cols and numeric_cols:
-        return "bar"
-
-    # Default: table
-    return "table"
-
-
-def render_chart(df: pd.DataFrame, chart_type: str) -> None:
-    """
-    Render a Plotly chart based on the detected type.
-
-    Args:
-        df: DataFrame to visualize
-        chart_type: One of 'line', 'bar', 'table'
-    """
+def render_data_table(df: pd.DataFrame) -> None:
+    """Render only the raw data table (no chart)."""
     if df.empty:
         st.info("No data to display.")
         return
 
-    # Debug marker as requested by lead engineer
-    st.write(f"📊 **Rendering {chart_type.title()} Chart...**")
-
     try:
-        if chart_type == "line":
-            # Find the x-axis (time column) and y-axis (numeric column)
-            time_keywords = ["date", "time",
-                             "timestamp", "year", "month", "day"]
-            x_col = next(
-                (col for col in df.columns if any(kw in col.lower()
-                 for kw in time_keywords)),
-                df.columns[0]
-            )
-            numeric_cols = df.select_dtypes(
-                include=["int64", "float64", "int32", "float32"]).columns
-            y_col = numeric_cols[0] if len(numeric_cols) > 0 else df.columns[1]
-
-            # Sort by x for proper line chart
-            df_sorted = df.sort_values(by=x_col)
-
-            fig = px.line(
-                df_sorted,
-                x=x_col,
-                y=y_col,
-                title=f"{y_col.replace('_', ' ').title()} Over Time",
-                markers=True
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-
-        elif chart_type == "bar":
-            # Find categorical and numeric columns
-            categorical_cols = [
-                col for col in df.select_dtypes(include=["object"]).columns
-                if df[col].nunique() <= 500
-            ]
-            numeric_cols = df.select_dtypes(
-                include=["int64", "float64", "int32", "float32"]).columns
-
-            x_col = categorical_cols[0] if categorical_cols else df.columns[0]
-            y_col = numeric_cols[0] if len(numeric_cols) > 0 else df.columns[1]
-
-            # Sort by value descending, limit to top 15
-            df_sorted = df.sort_values(by=y_col, ascending=False).head(15)
-
-            fig = px.bar(
-                df_sorted,
-                x=x_col,
-                y=y_col,
-                title=f"{y_col.replace('_', ' ').title()} by {x_col.replace('_', ' ').title()}"
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-
-        # Always show raw data table below chart (or as primary for table type)
-        with st.expander("📋 View Raw Data", expanded=(chart_type == "table")):
+        with st.expander("📋 View Raw Data", expanded=True):
             st.dataframe(df, use_container_width=True)
             st.caption(f"{len(df)} rows")
 
     except Exception as e:
-        st.warning(f"Could not render chart: {e}")
+        st.warning(f"Could not render table: {e}")
         st.dataframe(df, use_container_width=True)
 
 
@@ -582,7 +472,7 @@ def render_response(answer: str, data: Any, metadata: Dict, pii: Optional[Dict[s
         else:
             st.caption("No PII entities detected in the question.")
 
-    # Normalize and render data visualization if present
+    # Normalize and render table if present
     normalized_data = normalize_query_data(data)
     if normalized_data and len(normalized_data) > 0:
         try:
@@ -615,8 +505,7 @@ def render_response(answer: str, data: Any, metadata: Dict, pii: Optional[Dict[s
                     # Keep as original if conversion fails
                     pass
 
-            chart_type = detect_chart_type(df)
-            render_chart(df, chart_type)
+            render_data_table(df)
 
         except Exception as e:
             st.warning(f"Could not process visualization: {e}")

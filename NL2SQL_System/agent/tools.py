@@ -1,5 +1,7 @@
 """LangChain tool wrappers for MCP tools."""
 from typing import Dict, Any, List
+import ast
+import json
 
 from mcp_tools.summarize_results import summarize_results as mcp_summarize_results
 from mcp_tools.execute_sql import execute_sql as mcp_execute_sql
@@ -15,15 +17,18 @@ from loguru import logger
 @tool
 def get_schema_tool(role: str = "admin") -> Dict[str, Any]:
     """
-    Retrieve the database schema filtered by user role.
+    Retrieve the database schema with admin-level visibility.
 
     Args:
-        role: User role ('admin' or 'viewer') for schema filtering
+        role: Requested user role (currently preserved for compatibility)
 
     Returns:
         Dict containing tables and their column information.
     """
-    return mcp_get_schema(role)
+    logger.info(f"LangChain tool: get_schema_tool invoked role={role}")
+    result = mcp_get_schema(role)
+    logger.info(f"LangChain tool: get_schema_tool completed tables={len(result.get('tables', []))}")
+    return result
 
 
 @tool
@@ -41,7 +46,7 @@ def generate_sql_tool(question: str, db_schema: str) -> str:
     Returns:
         Generated SQL query string
     """
-    logger.info("LangChain tool: generate_sql_tool invoked")
+    logger.info(f"LangChain tool: generate_sql_tool invoked question={str(question)[:180]}")
     import json
 
     # Parse schema if it's a string
@@ -51,11 +56,12 @@ def generate_sql_tool(question: str, db_schema: str) -> str:
         schema_dict = db_schema
 
     result = mcp_generate_sql(question, schema_dict)
+    logger.info(f"LangChain tool: generate_sql_tool completed sql={result['sql'][:220]}")
     return result["sql"]
 
 
 @tool
-def execute_sql_tool(sql: str, role: str = "admin") -> str:
+def execute_sql_tool(sql: str, role: str = "admin") -> Dict[str, Any]:
     """
     Safely execute a SQL query with automatic safety checks, LIMIT enforcement, and RBAC validation.
 
@@ -70,17 +76,19 @@ def execute_sql_tool(sql: str, role: str = "admin") -> str:
         role: User role ('admin' or 'viewer') for access control
 
     Returns:
-        JSON string containing query results with columns, rows, and row_count
+        Dict containing query results with columns, rows, and row_count
     """
-    logger.info("LangChain tool: execute_sql_tool invoked")
-    import json
+    logger.info(f"LangChain tool: execute_sql_tool invoked role={role} sql={str(sql)[:220]}")
 
     result = mcp_execute_sql(sql, role)
-    return json.dumps(result)
+    logger.info(
+        f"LangChain tool: execute_sql_tool completed rows={result.get('row_count', '?')} cols={len(result.get('columns', []))}"
+    )
+    return result
 
 
 @tool
-def summarize_results_tool(question: str, results: str) -> str:
+def summarize_results_tool(question: str, results: Any) -> str:
     """
     Generate an intelligent, human-readable summary of query results.
 
@@ -89,16 +97,23 @@ def summarize_results_tool(question: str, results: str) -> str:
 
     Args:
         question: Original natural language question from the user
-        results: Query results as JSON string from execute_sql_tool
+        results: Query results from execute_sql_tool (dict or JSON-like string)
 
     Returns:
         Natural language summary with insights
     """
-    logger.info("LangChain tool: summarize_results_tool invoked")
-    import json
+    logger.info(f"LangChain tool: summarize_results_tool invoked question={str(question)[:160]}")
 
-    # Parse results
-    results_dict = json.loads(results)
+    # Parse results robustly: tool-call payloads may arrive as dict, JSON, or python-literal strings
+    if isinstance(results, dict):
+        results_dict = results
+    elif isinstance(results, str):
+        try:
+            results_dict = json.loads(results)
+        except json.JSONDecodeError:
+            results_dict = ast.literal_eval(results)
+    else:
+        raise ValueError("Invalid results payload type for summarize_results_tool")
 
     summary_result = mcp_summarize_results(
         question=question,
@@ -106,6 +121,7 @@ def summarize_results_tool(question: str, results: str) -> str:
         rows=results_dict["rows"],
         row_count=results_dict["row_count"]
     )
+    logger.info(f"LangChain tool: summarize_results_tool completed summary_len={len(summary_result['summary'])}")
 
     return summary_result["summary"]
 
@@ -122,7 +138,10 @@ def pii_detect_tool(text: str) -> Dict[str, Any]:
     Returns:
         Dict containing detected entities and their metadata.
     """
-    return mcp_pii_detect(text)
+    logger.info(f"LangChain tool: pii_detect_tool invoked text={str(text)[:160]}")
+    result = mcp_pii_detect(text)
+    logger.info(f"LangChain tool: pii_detect_tool completed entities={result.get('count', 0)}")
+    return result
 
 
 @tool
@@ -137,7 +156,10 @@ def pii_encode_tool(text: str) -> Dict[str, Any]:
     Returns:
         Dict containing the encoded_text and mapping metadata.
     """
-    return mcp_pii_encode(text)
+    logger.info(f"LangChain tool: pii_encode_tool invoked text={str(text)[:160]}")
+    result = mcp_pii_encode(text)
+    logger.info(f"LangChain tool: pii_encode_tool completed mappings={result.get('count', 0)}")
+    return result
 
 
 @tool
@@ -152,7 +174,9 @@ def pii_decode_tool(text: str) -> str:
     Returns:
         The decoded string with original values restored.
     """
+    logger.info(f"LangChain tool: pii_decode_tool invoked text={str(text)[:160]}")
     result = mcp_pii_decode(text)
+    logger.info("LangChain tool: pii_decode_tool completed")
     return result["decoded_text"]
 
 

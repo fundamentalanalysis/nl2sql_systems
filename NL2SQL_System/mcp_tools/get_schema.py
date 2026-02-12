@@ -1,25 +1,21 @@
 """MCP Tool A: get_schema - Retrieve database schema information."""
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from loguru import logger
 from database.connection import db_manager
 from app.config import settings
 from app.rbac_policy import filter_schema_for_role
+from utils.trace_logger import emit_trace_event, start_timer, elapsed_ms
 
 
-def get_schema(role: str = "admin") -> Dict[str, Any]:
+def get_schema(role: str = "admin", trace_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Retrieve the database schema (RBAC disabled - full access).
-    """
-    # Force admin role to bypass RBAC filtering effectively
-    target_role = "admin"
-    """
-    Retrieve the database schema filtered by user role.
+    Retrieve the database schema with RBAC filtering disabled (full schema access).
 
     This tool connects to MySQL and extracts schema information from INFORMATION_SCHEMA,
-    then filters the results based on RBAC policy.
+    then returns the full schema by forcing admin-level visibility.
 
     Args:
-        role: User role ('admin' or 'viewer') for schema filtering
+        role: Requested user role (ignored for filtering; kept for compatibility)
 
     Returns:
         Dict containing tables and their column information:
@@ -44,8 +40,21 @@ def get_schema(role: str = "admin") -> Dict[str, Any]:
     Raises:
         Exception: If database connection or query fails
     """
+    trace_id = trace_id or "no-trace"
+    effective_role = "admin"
+    timer = start_timer()
     logger.info("Executing get_schema tool")
     logger.info(f"Using database/schema: {settings.mysql_database}")
+    emit_trace_event(
+        event="TOOL_INPUT",
+        trace_id=trace_id,
+        tool="get_schema_tool",
+        payload={
+            "requested_role": role,
+            "effective_role": effective_role,
+            "database": settings.mysql_database,
+        },
+    )
 
     try:
         # Fallback: Get all tables (optimized single query)
@@ -93,24 +102,47 @@ def get_schema(role: str = "admin") -> Dict[str, Any]:
                 "name": table_name,
                 "columns": columns
             })
+        emit_trace_event(
+            event="INTERNAL_ACTION",
+            trace_id=trace_id,
+            tool="get_schema_tool",
+            payload={
+                "action": "schema_loaded_from_information_schema",
+                "table_count": len(schema_info["tables"]),
+                "schema_info": schema_info,
+            },
+        )
 
         logger.info(
             f"Retrieved full schema for {len(schema_info['tables'])} tables")
 
-        # Apply RBAC filtering
-        filtered_schema = filter_schema_for_role(schema_info, role)
+        # RBAC intentionally bypassed for schema discovery by forcing admin visibility.
+        filtered_schema = filter_schema_for_role(schema_info, effective_role)
         logger.info(
-            f"Filtered schema for role '{role}': {len(filtered_schema['tables'])} tables")
+            f"Returned schema for effective role '{effective_role}' (requested: '{role}'): "
+            f"{len(filtered_schema['tables'])} tables")
+        emit_trace_event(
+            event="TOOL_OUTPUT",
+            trace_id=trace_id,
+            tool="get_schema_tool",
+            payload={
+                "result": filtered_schema,
+                "execution_time_ms": elapsed_ms(timer),
+            },
+        )
 
         return filtered_schema
 
     except Exception as e:
         logger.error(f"Failed to retrieve schema: {e}")
+        emit_trace_event(
+            event="TOOL_ERROR",
+            trace_id=trace_id,
+            tool="get_schema_tool",
+            payload={
+                "error": str(e),
+                "execution_time_ms": elapsed_ms(timer),
+            },
+            level="error",
+        )
         raise
-
-
-if __name__ == "__main__":
-    # Test the tool
-    import json
-    schema = get_schema()
-    print(json.dumps(schema, indent=2))

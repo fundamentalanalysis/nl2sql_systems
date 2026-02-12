@@ -1,13 +1,14 @@
 """MCP Tool C: execute_sql - Safely execute SQL queries with RBAC enforcement."""
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from loguru import logger
 from database.connection import db_manager
 import re
 from app.rbac_policy import is_authorized
 import sqlparse
+from utils.trace_logger import emit_trace_event, start_timer, elapsed_ms
 
 
-def execute_sql(sql: str, role: str = "admin") -> Dict[str, Any]:
+def execute_sql(sql: str, role: str = "admin", trace_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Safely execute a SQL query with automatic safety checks, LIMIT enforcement, and RBAC validation.
 
@@ -33,30 +34,99 @@ def execute_sql(sql: str, role: str = "admin") -> Dict[str, Any]:
         ValueError: If SQL contains harmful operations or unauthorized access
         Exception: If query execution fails
     """
+    trace_id = trace_id or "no-trace"
+    timer = start_timer()
     logger.info(f"Executing SQL: {sql[:100]}...")
+    emit_trace_event(
+        event="TOOL_INPUT",
+        trace_id=trace_id,
+        tool="execute_sql_tool",
+        payload={
+            "sql": sql,
+            "role": role,
+        },
+    )
 
     try:
         # Validate SQL safety
         _validate_sql_safety(sql)
+        emit_trace_event(
+            event="INTERNAL_ACTION",
+            trace_id=trace_id,
+            tool="execute_sql_tool",
+            payload={"action": "sql_safety_validated"},
+        )
 
         # Apply RBAC validation
         _validate_sql_access(sql, role)
+        emit_trace_event(
+            event="INTERNAL_ACTION",
+            trace_id=trace_id,
+            tool="execute_sql_tool",
+            payload={"action": "rbac_validated", "role": role},
+        )
 
         # 1. Restore tokens to original values for DB execution
         from privacy.decoder import decode_text
         sql_to_execute = decode_text(sql)
+        emit_trace_event(
+            event="TRANSFORM",
+            trace_id=trace_id,
+            tool="execute_sql_tool",
+            payload={
+                "name": "decode_sql_tokens",
+                "input_sql": sql,
+                "output_sql": sql_to_execute,
+            },
+        )
         if sql_to_execute != sql:
             logger.info("Restored PII tokens in SQL query")
 
         # Apply LIMIT if not present
         sql_with_limit = _apply_limit(sql_to_execute)
+        emit_trace_event(
+            event="TRANSFORM",
+            trace_id=trace_id,
+            tool="execute_sql_tool",
+            payload={
+                "name": "apply_limit",
+                "input_sql": sql_to_execute,
+                "output_sql": sql_with_limit,
+            },
+        )
 
         # Execute query
+        emit_trace_event(
+            event="DB_QUERY",
+            trace_id=trace_id,
+            tool="execute_sql_tool",
+            payload={"sql": sql_with_limit},
+        )
         columns, rows, row_count = db_manager.execute_query(sql_with_limit)
+        emit_trace_event(
+            event="DB_RAW_RESULT",
+            trace_id=trace_id,
+            tool="execute_sql_tool",
+            payload={
+                "columns": columns,
+                "rows": rows,
+                "row_count": row_count,
+            },
+        )
 
         # 2. Re-encode database results (mask real PII with tokens)
         from privacy.encoder import encode_results
         encoded_rows = encode_results(columns, rows)
+        emit_trace_event(
+            event="TRANSFORM",
+            trace_id=trace_id,
+            tool="execute_sql_tool",
+            payload={
+                "name": "encode_result_pii",
+                "input_rows": rows,
+                "output_rows": encoded_rows,
+            },
+        )
         if encoded_rows != rows:
             logger.info("Masked PII in database results")
 
@@ -68,10 +138,29 @@ def execute_sql(sql: str, role: str = "admin") -> Dict[str, Any]:
 
         logger.info(
             f"Query executed successfully for role '{role}', returned {row_count} rows (masked)")
+        emit_trace_event(
+            event="TOOL_OUTPUT",
+            trace_id=trace_id,
+            tool="execute_sql_tool",
+            payload={
+                "result": result,
+                "execution_time_ms": elapsed_ms(timer),
+            },
+        )
         return result
 
     except Exception as e:
         logger.error(f"Failed to execute SQL: {e}")
+        emit_trace_event(
+            event="TOOL_ERROR",
+            trace_id=trace_id,
+            tool="execute_sql_tool",
+            payload={
+                "error": str(e),
+                "execution_time_ms": elapsed_ms(timer),
+            },
+            level="error",
+        )
         raise
 
 
@@ -90,7 +179,7 @@ def _validate_sql_safety(sql: str) -> None:
     # List of forbidden SQL keywords
     forbidden_keywords = [
         'UPDATE', 'DELETE', 'INSERT', 'ALTER',
-        'DROP', 'TRUNCATE', 'CREATE', 'REPLACE',
+        'DROP', 'TRUNCATE', 'CREATE',
         'GRANT', 'REVOKE', 'EXECUTE', 'CALL',
         'LOAD', 'OUTFILE', 'INFILE'
     ]
@@ -102,6 +191,13 @@ def _validate_sql_safety(sql: str) -> None:
                 f"Harmful SQL operation detected: {keyword}. "
                 "Only SELECT queries are allowed for security reasons."
             )
+
+    # Allow REPLACE(...) function in SELECT expressions, but block REPLACE statements.
+    if re.match(r'^\s*REPLACE\b', sql_upper):
+        raise ValueError(
+            "Harmful SQL operation detected: REPLACE statement. "
+            "Only SELECT queries are allowed for security reasons."
+        )
 
     # Ensure it starts with SELECT
     if not sql_upper.startswith('SELECT'):
@@ -264,22 +360,3 @@ def _apply_limit(sql: str) -> str:
     logger.debug("Applied automatic LIMIT 200 to query")
 
     return sql_with_limit
-
-
-if __name__ == "__main__":
-    # Test the tool
-    import json
-
-    # Test query without LIMIT
-    result = execute_sql("SELECT * FROM users")
-    print(json.dumps(result, indent=2))
-
-    # Test query with LIMIT
-    result = execute_sql("SELECT * FROM users LIMIT 10")
-    print(json.dumps(result, indent=2))
-
-    # Test harmful query (should fail)
-    try:
-        result = execute_sql("DELETE FROM users WHERE id = 1")
-    except ValueError as e:
-        print(f"Correctly rejected harmful query: {e}")
